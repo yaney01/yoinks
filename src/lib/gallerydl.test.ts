@@ -31,3 +31,14 @@ test('builds all, image-only, and video-only choices for mixed posts', () => {
     ['all media · 4 files', 'images only · 3 images', 'videos only · 1 video'],
   )
 })
+
+test('extracts actionable browser cookie diagnostics', () => {
+  const stderr = [
+    '[cookies][debug] Extracted 12 cookies from Chrome',
+    '[cookies][warning] Failed to decrypt cookie (AES-GCM MAC)',
+  ].join('\n')
+  assert.equal(
+    __test.cookieDiagnostic(stderr),
+    'Extracted 12 cookies from Chrome · Failed to decrypt cookie (AES-GCM MAC)',
+  )
+})
