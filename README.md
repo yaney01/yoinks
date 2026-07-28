@@ -26,15 +26,21 @@ Or run it without a permanent global install:
 npx yoinks
 ```
 
-Requires Node 22+. `yt-dlp` is downloaded automatically when needed. For image
-and gallery links, yoinks uses an existing `gallery-dl` installation or creates
-a private Python environment under `~/.yoinks/gallery-dl` and installs it there.
+Requires Node 22+. The managed download backends share one installation root:
 
-On macOS, installing gallery-dl with Homebrew first is optional but recommended:
-
-```sh
-brew install gallery-dl
+```text
+~/.yoinks/bin/
+├── yt-dlp
+└── gallery-dl/
 ```
+
+`yt-dlp` is downloaded automatically when needed. For image and gallery links,
+yoinks creates a private Python environment at `~/.yoinks/bin/gallery-dl` and
+installs `gallery-dl` inside it. A system/Homebrew installation is used only as
+a fallback when Python is unavailable.
+
+Existing versions that used `~/.yoinks/gallery-dl` no longer read that folder.
+After confirming the new version works, it can be removed manually.
 
 ## Usage
 
@@ -92,11 +98,11 @@ gallery-dl --cookies-from-browser chrome "<url>"
 ## How it works
 
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) handles video/audio extraction,
-  format selection, and downloads. Its standalone binary is cached in
-  `~/.yoinks/bin`.
+  format selection, and downloads. Its standalone binary is cached at
+  `~/.yoinks/bin/yt-dlp`.
 - [gallery-dl](https://github.com/mikf/gallery-dl) enumerates image galleries,
-  manga, carousels, and mixed-media posts. If it is not on PATH, yoinks can
-  install it in a private Python virtual environment.
+  manga, carousels, and mixed-media posts. Its managed environment is stored at
+  `~/.yoinks/bin/gallery-dl`.
 - ffmpeg is used for stream merging and MP3 extraction. yoinks checks PATH and
   falls back to `ffmpeg-static`.
 - The terminal UI is built with [Ink](https://github.com/vadimdemedes/ink).
