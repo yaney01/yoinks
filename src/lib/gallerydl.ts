@@ -4,7 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 
 const YOINKS_ROOT = path.join(os.homedir(), '.yoinks')
-const GALLERYDL_ENV_DIR = path.join(YOINKS_ROOT, 'gallery-dl')
+const YOINKS_BIN_DIR = path.join(YOINKS_ROOT, 'bin')
+const GALLERYDL_ENV_DIR = path.join(YOINKS_BIN_DIR, 'gallery-dl')
 
 const IMAGE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'heic', 'heif', 'jpeg', 'jpg', 'jxl', 'png', 'tif', 'tiff', 'webp'])
 const VIDEO_EXTENSIONS = new Set(['avi', 'flv', 'm2ts', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'webm', 'wmv'])
@@ -89,23 +90,22 @@ function galleryDlPaths(): {executable: string; python: string} {
 }
 
 /**
- * Prefer a system/Homebrew install. If it is missing, install gallery-dl into
- * a private venv under ~/.yoinks so users still invoke a single `yoinks` CLI.
+ * Keep both managed downloader backends under ~/.yoinks/bin. A system
+ * gallery-dl is used only as a fallback when Python is unavailable.
  */
 async function ensureGalleryDl(signal?: AbortSignal): Promise<string> {
-  if (await commandWorks('gallery-dl', ['--version'])) return 'gallery-dl'
-
   const local = galleryDlPaths()
   if (await commandWorks(local.executable, ['--version'])) return local.executable
 
   const python = await findPython()
   if (!python) {
+    if (await commandWorks('gallery-dl', ['--version'])) return 'gallery-dl'
     throw new Error(
-      'This link needs gallery-dl. Install it with “brew install gallery-dl” (macOS/Linux) or install Python 3, then try again.',
+      'This link needs gallery-dl. Install Python 3, or run “brew install gallery-dl” (macOS/Linux), then try again.',
     )
   }
 
-  await fs.mkdir(YOINKS_ROOT, {recursive: true})
+  await fs.mkdir(YOINKS_BIN_DIR, {recursive: true})
   await fs.rm(GALLERYDL_ENV_DIR, {recursive: true, force: true})
 
   try {
