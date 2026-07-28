@@ -5,12 +5,12 @@
   <img src="assets/logo-light.svg" alt="yoinks" width="288">
 </picture>
 
-yoink any video. paste. yoink. done.
+yoink videos, images, galleries, and audio. paste. choose. done.
 
-Download videos from YouTube, X/Twitter, Instagram, Threads, TikTok and
-1,800+ other sites — right from your terminal. Paste a url, pick a
-resolution (or audio-only mp3), done. No popups, no fake download buttons,
-no sketchy redirects.
+Download media from YouTube, X/Twitter, Instagram, Threads, TikTok, Pixiv,
+manga sites, and thousands of other supported pages — directly from your
+terminal. Video links keep the resolution and MP3 picker; galleries and mixed
+posts let you choose all media, images only, or videos only.
 
 <img src="assets/home.png" alt="yoinks home screen — paste a link and hit yoink" width="100%">
 
@@ -20,76 +20,117 @@ no sketchy redirects.
 npm install -g yoinks
 ```
 
-Or try it without installing anything:
+Or run it without a permanent global install:
 
 ```sh
 npx yoinks
 ```
 
-Requires Node 18+. Everything else (yt-dlp, ffmpeg) is fetched or bundled
-automatically.
+Requires Node 22+. `yt-dlp` is downloaded automatically when needed. For image
+and gallery links, yoinks uses an existing `gallery-dl` installation or creates
+a private Python environment under `~/.yoinks/gallery-dl` and installs it there.
+
+On macOS, installing gallery-dl with Homebrew first is optional but recommended:
+
+```sh
+brew install gallery-dl
+```
 
 ## Usage
 
 ```sh
-$ yoinks https://youtu.be/dQw4w9WgXcQ    # straight to the format picker
-$ yoinks                                 # prompts for a url
-$ yoinks --theme light                   # force the light palette
+$ yoinks https://youtu.be/dQw4w9WgXcQ
+$ yoinks https://www.instagram.com/reel/...
+$ yoinks https://www.instagram.com/p/DbAY89yiZrJ/
+$ yoinks
+$ yoinks --theme light
 ```
 
-yoinks takes over the terminal (full-screen, centered — and restores your
-scrollback on exit). Pick a format with ↑/↓ (or j/k, or number keys) and
-hit enter. `esc` goes back, `^c` quits. Or just use the mouse — the yoink
-button, the format list and the footer hints are all clickable, and
-clicking the logo takes you back home. Files are saved to `~/Downloads`,
-and the file path is printed to your terminal when you're done.
+yoinks takes over the terminal and restores your scrollback on exit. Pick an
+option with ↑/↓, j/k, number keys, or the mouse, then press enter. `esc` goes
+back and `^c` quits.
 
-The default `auto` theme uses your terminal's own foreground and background,
-so it follows light and dark terminal themes without guessing. Press `^t` or
-click the theme control in the footer to cycle through `auto`, `light`, and
-`dark` for the current session. Use `--theme auto`, `--theme light`, or
-`--theme dark` to choose the starting theme for one launch.
+Downloads are saved to `~/Downloads`:
 
-<img src="assets/download-options.png" alt="yoinks format picker — resolutions with estimated file sizes, plus audio-only mp3" width="100%">
+- Videos and audio are saved as individual files.
+- Galleries and mixed posts are saved in a site-and-post folder such as
+  `~/Downloads/instagram-DbAY89yiZrJ`.
+
+The default `auto` theme follows the terminal foreground and background. Press
+`^t` or click the theme control to cycle through `auto`, `light`, and `dark`.
+
+<img src="assets/download-options.png" alt="yoinks format picker — video resolutions, audio, and media choices" width="100%">
+
+## Media routing
+
+The input URL and extracted media determine which backend is used:
+
+```text
+Reels, videos, audio
+  └─ yt-dlp → resolution / MP3 choices
+
+Images, galleries, manga
+  └─ gallery-dl → original media files
+
+Mixed image + video posts
+  └─ gallery-dl → all / images only / videos only
+```
+
+Instagram `/p/` links are inspected with gallery-dl first. A single-video post
+is handed back to yt-dlp so resolution and audio options remain available.
+Instagram Reels go directly to yt-dlp. For other sites, yoinks tries yt-dlp and
+falls back to gallery-dl when the page is a gallery or collection.
+
+If gallery-dl needs authentication, configure its normal cookie settings. For
+example, add browser cookies to your gallery-dl configuration or verify the
+link directly with:
+
+```sh
+gallery-dl --cookies-from-browser chrome "<url>"
+```
 
 ## How it works
 
-- Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp). On first run,
-  yoinks downloads the standalone yt-dlp binary to `~/.yoinks/bin` —
-  no Python required. If you already have yt-dlp installed, it uses yours.
-- ffmpeg (needed for merging high-res streams and mp3 extraction) is found
-  on your PATH, with `ffmpeg-static` as a bundled fallback.
-- The UI is [Ink](https://github.com/vadimdemedes/ink) — React for the
-  terminal.
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) handles video/audio extraction,
+  format selection, and downloads. Its standalone binary is cached in
+  `~/.yoinks/bin`.
+- [gallery-dl](https://github.com/mikf/gallery-dl) enumerates image galleries,
+  manga, carousels, and mixed-media posts. If it is not on PATH, yoinks can
+  install it in a private Python virtual environment.
+- ffmpeg is used for stream merging and MP3 extraction. yoinks checks PATH and
+  falls back to `ffmpeg-static`.
+- The terminal UI is built with [Ink](https://github.com/vadimdemedes/ink).
 
 ## Development
 
 ```sh
 npm install
-npm run build        # bundle to dist/ with tsup
-npm run dev          # rebuild on change
-node dist/cli.js <url>
+npm test
 npm run typecheck
+npm run build
+node dist/cli.js <url>
 ```
 
-To try it as a global command without publishing: `npm link`, then run
-`yoinks` anywhere.
+To test the current checkout as a global command:
+
+```sh
+npm link
+yoinks <url>
+```
 
 ## Roadmap
 
-- [ ] `--best` / `--mp3` flags to skip the picker (scriptable mode)
-- [ ] `-o <dir>` to choose the output folder
-- [ ] Playlist / thread-with-multiple-videos support
-- [ ] Clipboard detection: launch bare and auto-suggest the url you copied
-- [ ] Self-update for the bundled yt-dlp binary (`yt-dlp -U`)
-- [x] Publish to npm (`npm i -g yoinks` / `npx yoinks`)
-- [ ] `curl yoinks.sh | sh` installer
+- [ ] `--best` / `--mp3` flags for scriptable downloads
+- [ ] `-o <dir>` to choose the output directory
+- [ ] Browser-cookie selection inside the UI
+- [ ] Detailed per-file progress for gallery downloads
+- [ ] Clipboard auto-suggestion without opening the input screen first
+- [ ] Self-update for cached downloader binaries
 
 ## A note on fair use
 
 yoinks is a personal-archiving tool. Downloading content may violate a
-platform's terms of service — only download what you have the right to
-keep, and be excellent to creators.
+platform's terms of service. Only download media you have the right to keep.
 
 ## License
 
