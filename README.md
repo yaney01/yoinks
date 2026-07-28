@@ -26,7 +26,7 @@ Or run it without a permanent global install:
 npx yoinks
 ```
 
-Requires Node 22+. The managed download backends share one installation root:
+Requires Node 22+. Both managed downloader backends live under one root:
 
 ```text
 ~/.yoinks/bin/
@@ -35,12 +35,18 @@ Requires Node 22+. The managed download backends share one installation root:
 ```
 
 `yt-dlp` is downloaded automatically when needed. For image and gallery links,
-yoinks creates a private Python environment at `~/.yoinks/bin/gallery-dl` and
-installs `gallery-dl` inside it. A system/Homebrew installation is used only as
-a fallback when Python is unavailable.
+yoinks creates a private Python environment under `~/.yoinks/bin/gallery-dl`
+and installs gallery-dl there. A system gallery-dl installation is used only
+when Python is unavailable.
 
-Existing versions that used `~/.yoinks/gallery-dl` no longer read that folder.
-After confirming the new version works, it can be removed manually.
+On macOS, installing Python and gallery-dl with Homebrew first remains optional:
+
+```sh
+brew install python gallery-dl
+```
+
+Older builds used `~/.yoinks/gallery-dl`. After confirming the new build works,
+that old directory can be removed manually.
 
 ## Usage
 
@@ -87,13 +93,24 @@ is handed back to yt-dlp so resolution and audio options remain available.
 Instagram Reels go directly to yt-dlp. For other sites, yoinks tries yt-dlp and
 falls back to gallery-dl when the page is a gallery or collection.
 
-If gallery-dl needs authentication, configure its normal cookie settings. For
-example, add browser cookies to your gallery-dl configuration or verify the
-link directly with:
+## Instagram login cookies
+
+Instagram frequently returns no media to anonymous requests. When this happens,
+yoinks automatically retries the probe with cookies from the logged-in Chrome
+profile and reuses the same cookies for the download. Chrome may request macOS
+Keychain permission the first time.
+
+Make sure the post opens while logged in at `instagram.com` in Chrome. For a
+non-default Chrome profile or another browser, set the cookie source for that
+run:
 
 ```sh
-gallery-dl --cookies-from-browser chrome "<url>"
+YOINKS_COOKIES_FROM_BROWSER="chrome:Profile 1" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="safari" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="firefox" yoinks "<instagram-url>"
 ```
+
+The value follows gallery-dl's `--cookies-from-browser` syntax.
 
 ## How it works
 
