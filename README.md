@@ -96,21 +96,26 @@ falls back to gallery-dl when the page is a gallery or collection.
 ## Instagram login cookies
 
 Instagram frequently returns no media to anonymous requests. When this happens,
-yoinks automatically retries the probe with cookies from the logged-in Chrome
-profile and reuses the same cookies for the download. Chrome may request macOS
-Keychain permission the first time.
+yoinks automatically retries with Chrome cookies. It scans the Chrome `Default`
+and numbered `Profile 1`, `Profile 2`, and later profile directories, then
+reuses the successful profile for the actual download.
 
-Make sure the post opens while logged in at `instagram.com` in Chrome. For a
-non-default Chrome profile or another browser, set the cookie source for that
-run:
+Chrome may request macOS Keychain permission the first time. If cookie access
+fails, yoinks now reports the underlying gallery-dl warning, such as a locked
+cookie database, decryption failure, missing profile, or permission error.
+Closing Chrome before retrying can resolve database-access failures.
+
+For Safari, Firefox, a custom Chrome location, or to force one profile, set the
+cookie source for that run:
 
 ```sh
-YOINKS_COOKIES_FROM_BROWSER="chrome:Profile 1" yoinks "<instagram-url>"
-YOINKS_COOKIES_FROM_BROWSER="safari" yoinks "<instagram-url>"
-YOINKS_COOKIES_FROM_BROWSER="firefox" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="chrome/instagram.com:Profile 1" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="safari/instagram.com" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="firefox/instagram.com" yoinks "<instagram-url>"
 ```
 
-The value follows gallery-dl's `--cookies-from-browser` syntax.
+The value follows gallery-dl's `--cookies-from-browser` syntax:
+`BROWSER[/DOMAIN][+KEYRING][:PROFILE][::CONTAINER]`.
 
 ## How it works
 
