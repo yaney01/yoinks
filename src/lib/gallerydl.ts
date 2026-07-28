@@ -27,6 +27,7 @@ export type GalleryProbe = {
 
 type GalleryItem = {url: string; extension?: string; metadata: Record<string, unknown>}
 type PythonCommand = {cmd: string; prefix: string[]}
+type GalleryAttempt = {items: GalleryItem[]; stderr: string}
 
 // Keep the browser-cookie source that made a probe succeed so the later
 // download uses the same authenticated Instagram session.
@@ -160,11 +161,57 @@ export function isInstagramReel(url: string): boolean {
   }
 }
 
-function instagramCookieSources(): string[] {
+function chromeProfileRoot(): string | undefined {
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome')
+  }
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA
+    return localAppData ? path.join(localAppData, 'Google', 'Chrome', 'User Data') : undefined
+  }
+  return path.join(os.homedir(), '.config', 'google-chrome')
+}
+
+async function hasChromeCookies(profileDir: string): Promise<boolean> {
+  for (const candidate of [path.join(profileDir, 'Network', 'Cookies'), path.join(profileDir, 'Cookies')]) {
+    try {
+      await fs.access(candidate)
+      return true
+    } catch {
+      // Try the next known Chrome cookie database location.
+    }
+  }
+  return false
+}
+
+async function discoverChromeCookieSources(): Promise<string[]> {
+  const root = chromeProfileRoot()
+  const sources = ['chrome/instagram.com']
+  if (!root) return sources
+
+  try {
+    const entries = await fs.readdir(root, {withFileTypes: true})
+    const profiles = entries
+      .filter(entry => entry.isDirectory() && (entry.name === 'Default' || /^Profile \d+$/.test(entry.name)))
+      .map(entry => entry.name)
+      .sort((a, b) => (a === 'Default' ? -1 : b === 'Default' ? 1 : a.localeCompare(b, undefined, {numeric: true})))
+
+    for (const profile of profiles) {
+      if (await hasChromeCookies(path.join(root, profile))) {
+        sources.push(`chrome/instagram.com:${profile}`)
+      }
+    }
+  } catch {
+    // Chrome is not installed, or its profile directory is inaccessible.
+  }
+
+  return [...new Set(sources)]
+}
+
+async function instagramCookieSources(): Promise<string[]> {
   const configured = process.env.YOINKS_COOKIES_FROM_BROWSER?.trim()
-  // Chrome is the automatic fallback because it is the common macOS/Windows
-  // case. Other browsers and non-default profiles remain explicitly selectable.
-  return [...new Set([configured, 'chrome'].filter((value): value is string => Boolean(value)))]
+  const discovered = await discoverChromeCookieSources()
+  return [...new Set([configured, ...discovered].filter((value): value is string => Boolean(value)))]
 }
 
 function metadataString(metadata: Record<string, unknown>, keys: string[]): string | undefined {
@@ -269,13 +316,27 @@ function galleryUploader(items: GalleryItem[]): string | undefined {
   return undefined
 }
 
+function cookieDiagnostic(stderr: string): string | undefined {
+  const lines = stderr
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => /cookie|decrypt|keyring|permission|database|profile|session|login/i.test(line))
+    .map(line => line.replace(/^\[[^\]]+\](?:\[[^\]]+\])?\s*/, ''))
+
+  const unique = [...new Set(lines)]
+  const selected = unique.slice(-2).join(' · ')
+  return selected ? selected.slice(0, 360) : undefined
+}
+
 async function probeGalleryItems(
   gallerydl: string,
   url: string,
   cookieSource: string | undefined,
   signal?: AbortSignal,
-): Promise<GalleryItem[]> {
+): Promise<GalleryAttempt> {
   const args = [
+    ...(cookieSource ? ['--verbose'] : []),
     '--dump-json',
     '--simulate',
     '--no-input',
@@ -283,8 +344,8 @@ async function probeGalleryItems(
     ...(cookieSource ? ['--cookies-from-browser', cookieSource] : []),
     url,
   ]
-  const {stdout} = await runCommand(gallerydl, args, signal)
-  return parseGalleryJson(stdout)
+  const {stdout, stderr} = await runCommand(gallerydl, args, signal)
+  return {items: parseGalleryJson(stdout), stderr}
 }
 
 export async function probeGallery(url: string, signal?: AbortSignal): Promise<GalleryProbe> {
@@ -292,32 +353,44 @@ export async function probeGallery(url: string, signal?: AbortSignal): Promise<G
   let items: GalleryItem[] = []
   let lastError: unknown
   let cookieSource: string | undefined
+  const diagnostics: string[] = []
+  const sourcesTried: string[] = []
 
   try {
     // Default gallery-dl configuration is still honored on the first attempt.
-    items = await probeGalleryItems(gallerydl, url, undefined, signal)
+    const attempt = await probeGalleryItems(gallerydl, url, undefined, signal)
+    items = attempt.items
   } catch (error) {
     lastError = error
   }
 
   if (items.length === 0 && isInstagramUrl(url)) {
-    for (const source of instagramCookieSources()) {
+    for (const source of await instagramCookieSources()) {
+      sourcesTried.push(source)
       try {
-        items = await probeGalleryItems(gallerydl, url, source, signal)
+        const attempt = await probeGalleryItems(gallerydl, url, source, signal)
+        items = attempt.items
+        const diagnostic = cookieDiagnostic(attempt.stderr)
+        if (diagnostic) diagnostics.push(`${source}: ${diagnostic}`)
         if (items.length > 0) {
           cookieSource = source
           break
         }
       } catch (error) {
         lastError = error
+        if (error instanceof Error) diagnostics.push(`${source}: ${error.message}`)
       }
     }
   }
 
   if (items.length === 0) {
     if (isInstagramUrl(url)) {
+      const detail = diagnostics.at(-1)
+      const tried = sourcesTried.length ? ` Tried: ${sourcesTried.join(', ')}.` : ''
       throw new Error(
-        'Instagram returned no media. Confirm the post opens while logged in to Chrome. For another profile or browser, set YOINKS_COOKIES_FROM_BROWSER="chrome:Profile 1", "safari", or "firefox".',
+        detail
+          ? `Instagram cookies failed: ${detail}.${tried} Close Chrome and retry, or set YOINKS_COOKIES_FROM_BROWSER to the logged-in profile.`
+          : `Instagram returned no media after checking Chrome profiles.${tried} The post may be unavailable to the logged-in account.`,
       )
     }
     if (lastError instanceof Error) throw lastError
@@ -458,4 +531,6 @@ export const __test = {
   isInstagramReel,
   parseGalleryJson,
   summarizeGallery,
+  cookieDiagnostic,
+  discoverChromeCookieSources,
 }
