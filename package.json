@@ -1,7 +1,7 @@
 {
   "name": "yoinks",
   "version": "0.3.1",
-  "description": "yoink any video from YouTube, X, Instagram, Threads & 1800+ sites — right from your terminal. paste. yoink. done.",
+  "description": "Download videos, audio, images, galleries, and mixed-media posts from your terminal with yt-dlp and gallery-dl.",
   "type": "module",
   "bin": {
     "yoinks": "dist/cli.js"
@@ -10,7 +10,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsup",
@@ -23,8 +23,11 @@
   "author": "Pablo Stanley",
   "keywords": [
     "video",
+    "image",
+    "gallery",
     "downloader",
     "yt-dlp",
+    "gallery-dl",
     "youtube",
     "instagram",
     "twitter",
