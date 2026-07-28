@@ -28,6 +28,10 @@ export type GalleryProbe = {
 type GalleryItem = {url: string; extension?: string; metadata: Record<string, unknown>}
 type PythonCommand = {cmd: string; prefix: string[]}
 
+// Keep the browser-cookie source that made a probe succeed so the later
+// download uses the same authenticated Instagram session.
+const cookieSourceByUrl = new Map<string, string>()
+
 function commandWorks(cmd: string, args: string[]): Promise<boolean> {
   return new Promise(resolve => {
     let child
@@ -129,11 +133,19 @@ async function ensureGalleryDl(signal?: AbortSignal): Promise<string> {
   return local.executable
 }
 
+function isInstagramUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase()
+    return host === 'instagram.com' || host.endsWith('.instagram.com')
+  } catch {
+    return false
+  }
+}
+
 export function isInstagramPost(url: string): boolean {
   try {
     const parsed = new URL(url)
-    const host = parsed.hostname.toLowerCase()
-    return (host === 'instagram.com' || host.endsWith('.instagram.com')) && /^\/p\//.test(parsed.pathname)
+    return isInstagramUrl(url) && /^\/p\//.test(parsed.pathname)
   } catch {
     return false
   }
@@ -142,11 +154,17 @@ export function isInstagramPost(url: string): boolean {
 export function isInstagramReel(url: string): boolean {
   try {
     const parsed = new URL(url)
-    const host = parsed.hostname.toLowerCase()
-    return (host === 'instagram.com' || host.endsWith('.instagram.com')) && /^\/(reel|reels|tv)\//.test(parsed.pathname)
+    return isInstagramUrl(url) && /^\/(reel|reels|tv)\//.test(parsed.pathname)
   } catch {
     return false
   }
+}
+
+function instagramCookieSources(): string[] {
+  const configured = process.env.YOINKS_COOKIES_FROM_BROWSER?.trim()
+  // Chrome is the automatic fallback because it is the common macOS/Windows
+  // case. Other browsers and non-default profiles remain explicitly selectable.
+  return [...new Set([configured, 'chrome'].filter((value): value is string => Boolean(value)))]
 }
 
 function metadataString(metadata: Record<string, unknown>, keys: string[]): string | undefined {
@@ -251,15 +269,63 @@ function galleryUploader(items: GalleryItem[]): string | undefined {
   return undefined
 }
 
+async function probeGalleryItems(
+  gallerydl: string,
+  url: string,
+  cookieSource: string | undefined,
+  signal?: AbortSignal,
+): Promise<GalleryItem[]> {
+  const args = [
+    '--dump-json',
+    '--simulate',
+    '--no-input',
+    '--no-colors',
+    ...(cookieSource ? ['--cookies-from-browser', cookieSource] : []),
+    url,
+  ]
+  const {stdout} = await runCommand(gallerydl, args, signal)
+  return parseGalleryJson(stdout)
+}
+
 export async function probeGallery(url: string, signal?: AbortSignal): Promise<GalleryProbe> {
   const gallerydl = await ensureGalleryDl(signal)
-  const {stdout} = await runCommand(
-    gallerydl,
-    ['--dump-json', '--simulate', '--no-input', '--no-colors', url],
-    signal,
-  )
-  const items = parseGalleryJson(stdout)
-  if (items.length === 0) throw new Error('gallery-dl found no downloadable media at this link.')
+  let items: GalleryItem[] = []
+  let lastError: unknown
+  let cookieSource: string | undefined
+
+  try {
+    // Default gallery-dl configuration is still honored on the first attempt.
+    items = await probeGalleryItems(gallerydl, url, undefined, signal)
+  } catch (error) {
+    lastError = error
+  }
+
+  if (items.length === 0 && isInstagramUrl(url)) {
+    for (const source of instagramCookieSources()) {
+      try {
+        items = await probeGalleryItems(gallerydl, url, source, signal)
+        if (items.length > 0) {
+          cookieSource = source
+          break
+        }
+      } catch (error) {
+        lastError = error
+      }
+    }
+  }
+
+  if (items.length === 0) {
+    if (isInstagramUrl(url)) {
+      throw new Error(
+        'Instagram returned no media. Confirm the post opens while logged in to Chrome. For another profile or browser, set YOINKS_COOKIES_FROM_BROWSER="chrome:Profile 1", "safari", or "firefox".',
+      )
+    }
+    if (lastError instanceof Error) throw lastError
+    throw new Error('gallery-dl found no downloadable media at this link.')
+  }
+
+  if (cookieSource) cookieSourceByUrl.set(url, cookieSource)
+  else cookieSourceByUrl.delete(url)
 
   return {
     title: galleryTitle(items, url),
@@ -339,6 +405,7 @@ export function downloadGallery(
       try {
         const gallerydl = await ensureGalleryDl(signal)
         const targetDir = galleryOutputDir(opts.url, opts.outDir)
+        const cookieSource = cookieSourceByUrl.get(opts.url)
         await fs.mkdir(targetDir, {recursive: true})
         onProcessing()
 
@@ -351,6 +418,7 @@ export function downloadGallery(
           'after:{_path}',
           '--Print',
           'skip:{_path}',
+          ...(cookieSource ? ['--cookies-from-browser', cookieSource] : []),
           ...galleryFilter(opts.mode),
           opts.url,
         ]
