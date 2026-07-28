@@ -12,14 +12,15 @@ import {isProbablyUrl} from './lib/platforms.js'
 const VERSION: string = createRequire(import.meta.url)('../package.json').version
 
 const HELP = `
-  yoinks — yoink any video. paste. yoink. done.
+  yoinks — yoink videos, images, galleries, and audio.
 
   Usage
     $ yoinks [url]
 
   Examples
     $ yoinks https://youtu.be/dQw4w9WgXcQ
-    $ yoinks https://x.com/user/status/123456
+    $ yoinks https://www.instagram.com/reel/abc123/
+    $ yoinks https://www.instagram.com/p/DbAY89yiZrJ/
     $ yoinks                 (prompts for a url)
 
   Options
@@ -28,7 +29,7 @@ const HELP = `
     -v, --version   show version
 
   Downloads are saved to ~/Downloads.
-  Powered by yt-dlp — YouTube, X, Instagram, Threads, TikTok & 1800+ sites.
+  Powered by yt-dlp + gallery-dl.
 `
 
 const args = parseArgs(process.argv.slice(2))
