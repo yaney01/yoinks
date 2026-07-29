@@ -28,9 +28,10 @@ export type GalleryProbe = {
 type GalleryItem = {url: string; extension?: string; metadata: Record<string, unknown>}
 type PythonCommand = {cmd: string; prefix: string[]}
 type GalleryAttempt = {items: GalleryItem[]; stderr: string}
+type ChromeProfile = {name: string; cookieDatabase: string}
 
-// Keep the browser-cookie source that made a probe succeed so the later
-// download uses the same authenticated Instagram session.
+// Keep the authenticated source that made a probe succeed so the later
+// download uses the same Instagram session.
 const cookieSourceByUrl = new Map<string, string>()
 
 function commandWorks(cmd: string, args: string[]): Promise<boolean> {
@@ -172,22 +173,59 @@ function chromeProfileRoot(): string | undefined {
   return path.join(os.homedir(), '.config', 'google-chrome')
 }
 
-async function hasChromeCookies(profileDir: string): Promise<boolean> {
+async function chromeCookieDatabase(profileDir: string): Promise<string | undefined> {
   for (const candidate of [path.join(profileDir, 'Network', 'Cookies'), path.join(profileDir, 'Cookies')]) {
     try {
       await fs.access(candidate)
-      return true
+      return candidate
     } catch {
       // Try the next known Chrome cookie database location.
     }
   }
-  return false
+  return undefined
 }
 
-async function discoverChromeCookieSources(): Promise<string[]> {
+async function copyIfPresent(source: string, destination: string): Promise<void> {
+  try {
+    await fs.copyFile(source, destination)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+async function hasInstagramSessionCookie(
+  python: PythonCommand,
+  cookieDatabase: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'yoinks-cookies-'))
+  const copiedDatabase = path.join(tempDir, 'Cookies')
+  try {
+    // Query a copy so Chrome may remain open and its live SQLite database is
+    // never modified. Copy WAL files as well so recent logins are visible.
+    await fs.copyFile(cookieDatabase, copiedDatabase)
+    await copyIfPresent(`${cookieDatabase}-wal`, `${copiedDatabase}-wal`)
+    await copyIfPresent(`${cookieDatabase}-shm`, `${copiedDatabase}-shm`)
+
+    const script = [
+      'import sqlite3, sys',
+      'db = sqlite3.connect(sys.argv[1])',
+      "row = db.execute(\"SELECT 1 FROM cookies WHERE name='sessionid' AND host_key LIKE '%instagram.com' LIMIT 1\").fetchone()",
+      "print('1' if row else '0')",
+    ].join('; ')
+    const {stdout} = await runCommand(python.cmd, [...python.prefix, '-c', script, copiedDatabase], signal)
+    return stdout.trim() === '1'
+  } catch {
+    return false
+  } finally {
+    await fs.rm(tempDir, {recursive: true, force: true})
+  }
+}
+
+async function discoverLoggedInChromeSources(signal?: AbortSignal): Promise<string[]> {
   const root = chromeProfileRoot()
-  const sources = ['chrome/instagram.com']
-  if (!root) return sources
+  const python = await findPython()
+  if (!root || !python) return []
 
   try {
     const entries = await fs.readdir(root, {withFileTypes: true})
@@ -196,22 +234,27 @@ async function discoverChromeCookieSources(): Promise<string[]> {
       .map(entry => entry.name)
       .sort((a, b) => (a === 'Default' ? -1 : b === 'Default' ? 1 : a.localeCompare(b, undefined, {numeric: true})))
 
-    for (const profile of profiles) {
-      if (await hasChromeCookies(path.join(root, profile))) {
-        sources.push(`chrome/instagram.com:${profile}`)
+    const loggedIn: string[] = []
+    for (const name of profiles) {
+      const cookieDatabase = await chromeCookieDatabase(path.join(root, name))
+      if (!cookieDatabase) continue
+      const profile: ChromeProfile = {name, cookieDatabase}
+      if (await hasInstagramSessionCookie(python, profile.cookieDatabase, signal)) {
+        loggedIn.push(`chrome/instagram.com:${profile.name}`)
       }
     }
+    return loggedIn
   } catch {
-    // Chrome is not installed, or its profile directory is inaccessible.
+    return []
   }
-
-  return [...new Set(sources)]
 }
 
-async function instagramCookieSources(): Promise<string[]> {
+async function instagramCookieSources(signal?: AbortSignal): Promise<string[]> {
   const configured = process.env.YOINKS_COOKIES_FROM_BROWSER?.trim()
-  const discovered = await discoverChromeCookieSources()
-  return [...new Set([configured, ...discovered].filter((value): value is string => Boolean(value)))]
+  // An explicit source is authoritative. Do not silently generate more network
+  // requests with other profiles if the user selected one.
+  if (configured) return [configured]
+  return discoverLoggedInChromeSources(signal)
 }
 
 function metadataString(metadata: Record<string, unknown>, keys: string[]): string | undefined {
@@ -329,6 +372,10 @@ function cookieDiagnostic(stderr: string): string | undefined {
   return selected ? selected.slice(0, 360) : undefined
 }
 
+function isRateLimitMessage(value: string): boolean {
+  return /\b429\b|too many requests|rate[ -]?limit/i.test(value)
+}
+
 async function probeGalleryItems(
   gallerydl: string,
   url: string,
@@ -337,6 +384,10 @@ async function probeGalleryItems(
 ): Promise<GalleryAttempt> {
   const args = [
     ...(cookieSource ? ['--verbose'] : []),
+    '-R',
+    '0',
+    '--sleep-request',
+    '6.0-12.0',
     '--dump-json',
     '--simulate',
     '--no-input',
@@ -351,21 +402,19 @@ async function probeGalleryItems(
 export async function probeGallery(url: string, signal?: AbortSignal): Promise<GalleryProbe> {
   const gallerydl = await ensureGalleryDl(signal)
   let items: GalleryItem[] = []
-  let lastError: unknown
   let cookieSource: string | undefined
   const diagnostics: string[] = []
   const sourcesTried: string[] = []
 
-  try {
-    // Default gallery-dl configuration is still honored on the first attempt.
-    const attempt = await probeGalleryItems(gallerydl, url, undefined, signal)
-    items = attempt.items
-  } catch (error) {
-    lastError = error
-  }
+  if (isInstagramUrl(url)) {
+    const sources = await instagramCookieSources(signal)
+    if (sources.length === 0) {
+      throw new Error(
+        'No Chrome profile with an Instagram session was found. Log in to instagram.com in Chrome, then retry, or set YOINKS_COOKIES_FROM_BROWSER to the logged-in browser profile.',
+      )
+    }
 
-  if (items.length === 0 && isInstagramUrl(url)) {
-    for (const source of await instagramCookieSources()) {
+    for (const source of sources) {
       sourcesTried.push(source)
       try {
         const attempt = await probeGalleryItems(gallerydl, url, source, signal)
@@ -377,10 +426,18 @@ export async function probeGallery(url: string, signal?: AbortSignal): Promise<G
           break
         }
       } catch (error) {
-        lastError = error
-        if (error instanceof Error) diagnostics.push(`${source}: ${error.message}`)
+        const message = error instanceof Error ? error.message : String(error)
+        if (isRateLimitMessage(message)) {
+          throw new Error(
+            `Instagram rate limit reached while using ${source}. Stop retrying now. Wait at least 30–60 minutes, open the post in that same browser profile, then retry once.`,
+          )
+        }
+        diagnostics.push(`${source}: ${message}`)
       }
     }
+  } else {
+    const attempt = await probeGalleryItems(gallerydl, url, undefined, signal)
+    items = attempt.items
   }
 
   if (items.length === 0) {
@@ -389,11 +446,10 @@ export async function probeGallery(url: string, signal?: AbortSignal): Promise<G
       const tried = sourcesTried.length ? ` Tried: ${sourcesTried.join(', ')}.` : ''
       throw new Error(
         detail
-          ? `Instagram cookies failed: ${detail}.${tried} Close Chrome and retry, or set YOINKS_COOKIES_FROM_BROWSER to the logged-in profile.`
-          : `Instagram returned no media after checking Chrome profiles.${tried} The post may be unavailable to the logged-in account.`,
+          ? `Instagram cookies failed: ${detail}.${tried}`
+          : `Instagram returned no media for the logged-in Chrome profile.${tried}`,
       )
     }
-    if (lastError instanceof Error) throw lastError
     throw new Error('gallery-dl found no downloadable media at this link.')
   }
 
@@ -485,6 +541,8 @@ export function downloadGallery(
         const args = [
           '--no-input',
           '--no-colors',
+          '--sleep-request',
+          '6.0-12.0',
           '-D',
           targetDir,
           '--Print',
@@ -529,8 +587,8 @@ function cleanGalleryDlError(stderr: string): string {
 export const __test = {
   isInstagramPost,
   isInstagramReel,
+  cookieDiagnostic,
+  isRateLimitMessage,
   parseGalleryJson,
   summarizeGallery,
-  cookieDiagnostic,
-  discoverChromeCookieSources,
 }
