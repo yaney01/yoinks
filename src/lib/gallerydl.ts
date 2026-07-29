@@ -316,7 +316,7 @@ function extensionFromUrl(value: string): string | undefined {
 
 function collectGalleryItems(value: unknown, items: GalleryItem[]): void {
   if (Array.isArray(value)) {
-    if (value[0] === 2 && typeof value[1] === 'string') {
+    if (value[0] === 3 && typeof value[1] === 'string') {
       const metadata = value[2] && typeof value[2] === 'object' ? (value[2] as Record<string, unknown>) : {}
       const extension = metadataString(metadata, ['extension'])?.toLowerCase() ?? extensionFromUrl(value[1])
       items.push({url: value[1], extension, metadata})

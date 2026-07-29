@@ -12,8 +12,9 @@ test('recognizes Instagram posts and Reels separately', () => {
 test('parses gallery-dl JSON messages and classifies mixed media', () => {
   const stdout = JSON.stringify([
     [1, '', {title: 'Example'}],
-    [2, 'https://cdn.example/1.jpg', {extension: 'jpg'}],
-    [2, 'https://cdn.example/2.mp4', {extension: 'mp4'}],
+    [2, null, {title: 'Example post'}],
+    [3, 'https://cdn.example/1.jpg', {extension: 'jpg'}],
+    [3, 'https://cdn.example/2.mp4', {extension: 'mp4'}],
   ])
   const items = __test.parseGalleryJson(stdout)
   assert.equal(items.length, 2)
