@@ -32,19 +32,40 @@ test('builds all, image-only, and video-only choices for mixed posts', () => {
   )
 })
 
-test('extracts actionable browser cookie diagnostics', () => {
+test('does not classify successful browser cookie logs as failures', () => {
   const stderr = [
-    '[cookies][debug] Extracted 12 cookies from Chrome',
-    '[cookies][warning] Failed to decrypt cookie (AES-GCM MAC)',
+    '[cookies][info] Extracted 13 cookies from Chrome',
+    "[cookies][debug] version breakdown: {'v10': 13, 'other': 0, 'unencrypted': 0}",
   ].join('\n')
+  assert.equal(__test.cookieDiagnostic(stderr), undefined)
+})
+
+test('extracts actual browser cookie failures', () => {
   assert.equal(
-    __test.cookieDiagnostic(stderr),
-    'Extracted 12 cookies from Chrome · Failed to decrypt cookie (AES-GCM MAC)',
+    __test.cookieDiagnostic('[cookies][warning] Failed to decrypt cookie (AES-GCM MAC)'),
+    'Failed to decrypt cookie (AES-GCM MAC)',
   )
 })
 
-test('detects Instagram rate-limit failures and not unrelated errors', () => {
-  assert.equal(__test.isRateLimitMessage("'429 Too Many Requests' for Instagram"), true)
-  assert.equal(__test.isRateLimitMessage('API rate limit exceeded'), true)
-  assert.equal(__test.isRateLimitMessage('Failed to decrypt cookie'), false)
+test('extracts Instagram response failures without cookie success noise', () => {
+  const stderr = [
+    '[cookies][info] Extracted 13 cookies from Chrome',
+    "[cookies][debug] version breakdown: {'v10': 13}",
+    '[instagram][warning] Login required for this endpoint',
+  ].join('\n')
+  assert.equal(__test.instagramDiagnostic(stderr), 'Login required for this endpoint')
+})
+
+test('detects Instagram rate-limit responses', () => {
+  assert.equal(__test.isRateLimitMessage('429 Too Many Requests'), true)
+  assert.equal(__test.isRateLimitMessage('API rate limit reached'), true)
+  assert.equal(__test.isRateLimitMessage('not found'), false)
+})
+
+test('prioritizes the last-used Chrome profile and includes subdomain cookies', () => {
+  assert.deepEqual(
+    __test.orderChromeProfiles(['Default', 'Profile 2', 'Profile 3'], 'Profile 3'),
+    ['Profile 3', 'Default', 'Profile 2'],
+  )
+  assert.equal(__test.chromeCookieSource('Default'), 'chrome/.instagram.com:Default')
 })
