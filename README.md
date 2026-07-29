@@ -95,15 +95,19 @@ falls back to gallery-dl when the page is a gallery or collection.
 
 ## Instagram login cookies
 
-Instagram frequently returns no media to anonymous requests. When this happens,
-yoinks automatically retries with Chrome cookies. It scans the Chrome `Default`
-and numbered `Profile 1`, `Profile 2`, and later profile directories, then
-reuses the successful profile for the actual download.
+Instagram frequently returns no media to anonymous requests. yoinks inspects the
+local Chrome cookie databases without sending network requests and selects only
+profiles that contain an Instagram `sessionid` cookie. The successful profile is
+then reused for the actual download.
+
+This avoids trying every Chrome profile against Instagram. Probe requests also
+use zero automatic HTTP retries and a conservative 6–12 second extraction
+interval. When Instagram returns `429 Too Many Requests`, yoinks stops immediately
+instead of trying another profile and worsening the rate limit.
 
 Chrome may request macOS Keychain permission the first time. If cookie access
-fails, yoinks now reports the underlying gallery-dl warning, such as a locked
-cookie database, decryption failure, missing profile, or permission error.
-Closing Chrome before retrying can resolve database-access failures.
+fails, yoinks reports the underlying gallery-dl warning, such as a locked cookie
+database, decryption failure, missing profile, or permission error.
 
 For Safari, Firefox, a custom Chrome location, or to force one profile, set the
 cookie source for that run:
@@ -116,6 +120,10 @@ YOINKS_COOKIES_FROM_BROWSER="firefox/instagram.com" yoinks "<instagram-url>"
 
 The value follows gallery-dl's `--cookies-from-browser` syntax:
 `BROWSER[/DOMAIN][+KEYRING][:PROFILE][::CONTAINER]`.
+
+After a `429` response, stop retrying for at least 30–60 minutes. Open the post
+normally in the same browser profile before making one new yoinks attempt. The
+restriction can last longer depending on the account, session, and network.
 
 ## How it works
 
