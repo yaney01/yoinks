@@ -1,0 +1,1276 @@
+name: Finalize dual-engine release
+
+on:
+  push:
+    branches:
+      - agent/unify-downloader-paths
+    paths:
+      - .github/workflows/finalize-dual-engine-release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/unify-downloader-paths
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Replace gallery-dl integration with release implementation
+        shell: bash
+        run: |
+          cat > src/lib/gallerydl.ts <<'TS'
+          import {spawn, type ChildProcess} from 'node:child_process'
+          import fs from 'node:fs/promises'
+          import os from 'node:os'
+          import path from 'node:path'
+
+          const YOINKS_ROOT = path.join(os.homedir(), '.yoinks')
+          const YOINKS_BIN_DIR = path.join(YOINKS_ROOT, 'bin')
+          const GALLERYDL_ENV_DIR = path.join(YOINKS_BIN_DIR, 'gallery-dl')
+          const GALLERYDL_NEXT_DIR = path.join(YOINKS_BIN_DIR, 'gallery-dl.next')
+          const GALLERYDL_BACKUP_DIR = path.join(YOINKS_BIN_DIR, 'gallery-dl.previous')
+          const CHROME_EPOCH_OFFSET_MICROSECONDS = 11_644_473_600_000_000
+
+          const IMAGE_EXTENSIONS = new Set([
+            'avif',
+            'bmp',
+            'gif',
+            'heic',
+            'heif',
+            'jpeg',
+            'jpg',
+            'jxl',
+            'png',
+            'tif',
+            'tiff',
+            'webp',
+          ])
+          const VIDEO_EXTENSIONS = new Set([
+            'avi',
+            'flv',
+            'm2ts',
+            'm4v',
+            'mkv',
+            'mov',
+            'mp4',
+            'mpeg',
+            'mpg',
+            'ts',
+            'webm',
+            'wmv',
+          ])
+
+          export type GalleryMode = 'all' | 'images' | 'videos'
+
+          export type GallerySummary = {
+            count: number
+            imageCount: number
+            videoCount: number
+            otherCount: number
+          }
+
+          export type GalleryProbe = {
+            title: string
+            uploader?: string
+            summary: GallerySummary
+          }
+
+          type GalleryItem = {url: string; extension?: string; metadata: Record<string, unknown>}
+          type PythonCommand = {cmd: string; prefix: string[]}
+
+          const instagramCookieByUrl = new Map<string, string>()
+
+          class CommandError extends Error {
+            readonly stderr: string
+            readonly exitCode: number | null
+
+            constructor(message: string, stderr: string, exitCode: number | null) {
+              super(message)
+              this.name = 'CommandError'
+              this.stderr = stderr
+              this.exitCode = exitCode
+            }
+          }
+
+          function commandWorks(cmd: string, args: string[]): Promise<boolean> {
+            return new Promise(resolve => {
+              let child
+              try {
+                child = spawn(cmd, args, {stdio: 'ignore', timeout: 10_000})
+              } catch {
+                resolve(false)
+                return
+              }
+              child.on('error', () => resolve(false))
+              child.on('close', (code: number | null) => resolve(code === 0))
+            })
+          }
+
+          function runCommand(
+            cmd: string,
+            args: string[],
+            signal?: AbortSignal,
+          ): Promise<{stdout: string; stderr: string}> {
+            return new Promise((resolve, reject) => {
+              const child = spawn(cmd, args, {signal})
+              let stdout = ''
+              let stderr = ''
+              child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()))
+              child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
+              child.on('error', reject)
+              child.on('close', (code: number | null) => {
+                if (code === 0) {
+                  resolve({stdout, stderr})
+                  return
+                }
+                reject(
+                  new CommandError(
+                    cleanGalleryDlError(stderr) || `${path.basename(cmd)} exited with code ${code}`,
+                    stderr,
+                    code,
+                  ),
+                )
+              })
+            })
+          }
+
+          function pythonCandidates(): PythonCommand[] {
+            const configured = process.env.YOINKS_PYTHON?.trim()
+            if (process.platform === 'win32') {
+              return [
+                ...(configured ? [{cmd: configured, prefix: []}] : []),
+                {cmd: 'py', prefix: ['-3']},
+                {cmd: 'python3', prefix: []},
+                {cmd: 'python', prefix: []},
+              ]
+            }
+            return [
+              ...(configured ? [{cmd: configured, prefix: []}] : []),
+              ...(process.platform === 'darwin'
+                ? [
+                    {cmd: '/opt/homebrew/bin/python3', prefix: []},
+                    {cmd: '/usr/local/bin/python3', prefix: []},
+                  ]
+                : []),
+              {cmd: 'python3', prefix: []},
+              {cmd: 'python', prefix: []},
+            ]
+          }
+
+          async function pythonIsSuitable(candidate: PythonCommand): Promise<boolean> {
+            const script = [
+              'import ssl, sys',
+              "assert sys.version_info >= (3, 10), 'Python 3.10+ required'",
+              "assert 'OpenSSL' in ssl.OPENSSL_VERSION, ssl.OPENSSL_VERSION",
+            ].join('; ')
+            return commandWorks(candidate.cmd, [...candidate.prefix, '-c', script])
+          }
+
+          async function findPython(): Promise<PythonCommand | undefined> {
+            for (const candidate of pythonCandidates()) {
+              if (await pythonIsSuitable(candidate)) return candidate
+            }
+            return undefined
+          }
+
+          function galleryDlPaths(root = GALLERYDL_ENV_DIR): {executable: string; python: string} {
+            if (process.platform === 'win32') {
+              return {
+                executable: path.join(root, 'Scripts', 'gallery-dl.exe'),
+                python: path.join(root, 'Scripts', 'python.exe'),
+              }
+            }
+            return {
+              executable: path.join(root, 'bin', 'gallery-dl'),
+              python: path.join(root, 'bin', 'python'),
+            }
+          }
+
+          async function managedGalleryDlWorks(): Promise<boolean> {
+            const local = galleryDlPaths()
+            return (await pythonIsSuitable({cmd: local.python, prefix: []})) && commandWorks(local.executable, ['--version'])
+          }
+
+          async function swapGalleryDlEnvironment(): Promise<void> {
+            await fs.rm(GALLERYDL_BACKUP_DIR, {recursive: true, force: true})
+            let hasBackup = false
+            try {
+              await fs.rename(GALLERYDL_ENV_DIR, GALLERYDL_BACKUP_DIR)
+              hasBackup = true
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+            }
+
+            try {
+              await fs.rename(GALLERYDL_NEXT_DIR, GALLERYDL_ENV_DIR)
+              await fs.rm(GALLERYDL_BACKUP_DIR, {recursive: true, force: true})
+            } catch (error) {
+              await fs.rm(GALLERYDL_ENV_DIR, {recursive: true, force: true})
+              if (hasBackup) await fs.rename(GALLERYDL_BACKUP_DIR, GALLERYDL_ENV_DIR)
+              throw error
+            }
+          }
+
+          async function installManagedGalleryDl(
+            onStatus: (message: string) => void,
+            signal?: AbortSignal,
+          ): Promise<string> {
+            const python = await findPython()
+            if (!python) {
+              throw new Error(
+                'gallery-dl needs Python 3.10+ linked with OpenSSL. On macOS run “brew install python”, then retry.',
+              )
+            }
+
+            onStatus('installing latest gallery-dl…')
+            await fs.mkdir(YOINKS_BIN_DIR, {recursive: true})
+            await fs.rm(GALLERYDL_NEXT_DIR, {recursive: true, force: true})
+            const next = galleryDlPaths(GALLERYDL_NEXT_DIR)
+
+            try {
+              await runCommand(python.cmd, [...python.prefix, '-m', 'venv', GALLERYDL_NEXT_DIR], signal)
+              await runCommand(
+                next.python,
+                ['-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'gallery-dl'],
+                signal,
+              )
+              if (!(await commandWorks(next.executable, ['--version']))) {
+                throw new Error('the new gallery-dl environment could not be started')
+              }
+              await swapGalleryDlEnvironment()
+            } catch (error) {
+              await fs.rm(GALLERYDL_NEXT_DIR, {recursive: true, force: true})
+              throw new Error(
+                `Could not install gallery-dl. ${error instanceof Error ? error.message : String(error)}`,
+              )
+            }
+
+            return galleryDlPaths().executable
+          }
+
+          async function ensureGalleryDl(signal?: AbortSignal): Promise<string> {
+            if (await managedGalleryDlWorks()) return galleryDlPaths().executable
+
+            try {
+              return await installManagedGalleryDl(() => {}, signal)
+            } catch (error) {
+              if (await commandWorks('gallery-dl', ['--version'])) return 'gallery-dl'
+              throw error
+            }
+          }
+
+          export async function updateGalleryDl(
+            onStatus: (message: string) => void,
+            signal?: AbortSignal,
+          ): Promise<string> {
+            return installManagedGalleryDl(onStatus, signal)
+          }
+
+          function isInstagramUrl(url: string): boolean {
+            try {
+              const host = new URL(url).hostname.toLowerCase()
+              return host === 'instagram.com' || host.endsWith('.instagram.com')
+            } catch {
+              return false
+            }
+          }
+
+          export function isInstagramPost(url: string): boolean {
+            try {
+              return isInstagramUrl(url) && /^\/p\//.test(new URL(url).pathname)
+            } catch {
+              return false
+            }
+          }
+
+          export function isInstagramReel(url: string): boolean {
+            try {
+              return isInstagramUrl(url) && /^\/(reel|reels|tv)\//.test(new URL(url).pathname)
+            } catch {
+              return false
+            }
+          }
+
+          function chromeProfileRoot(): string | undefined {
+            if (process.platform === 'darwin') {
+              return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome')
+            }
+            if (process.platform === 'win32') {
+              const localAppData = process.env.LOCALAPPDATA
+              return localAppData ? path.join(localAppData, 'Google', 'Chrome', 'User Data') : undefined
+            }
+            return path.join(os.homedir(), '.config', 'google-chrome')
+          }
+
+          async function chromeCookieDatabase(profileDir: string): Promise<string | undefined> {
+            for (const candidate of [path.join(profileDir, 'Network', 'Cookies'), path.join(profileDir, 'Cookies')]) {
+              try {
+                await fs.access(candidate)
+                return candidate
+              } catch {
+                // Try the next Chrome cookie database location.
+              }
+            }
+            return undefined
+          }
+
+          async function copyIfPresent(source: string, destination: string): Promise<void> {
+            try {
+              await fs.copyFile(source, destination)
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+            }
+          }
+
+          async function hasValidInstagramSessionCookie(
+            python: PythonCommand,
+            cookieDatabase: string,
+            signal?: AbortSignal,
+          ): Promise<boolean> {
+            const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'yoinks-cookies-'))
+            const copiedDatabase = path.join(tempDir, 'Cookies')
+            try {
+              await fs.copyFile(cookieDatabase, copiedDatabase)
+              await copyIfPresent(`${cookieDatabase}-wal`, `${copiedDatabase}-wal`)
+              await copyIfPresent(`${cookieDatabase}-shm`, `${copiedDatabase}-shm`)
+
+              const nowChrome = Date.now() * 1000 + CHROME_EPOCH_OFFSET_MICROSECONDS
+              const script = [
+                'import sqlite3, sys',
+                'db = sqlite3.connect(sys.argv[1])',
+                "row = db.execute(\"SELECT 1 FROM cookies WHERE name='sessionid' AND host_key LIKE '%instagram.com' AND (expires_utc=0 OR expires_utc>?) LIMIT 1\", (int(sys.argv[2]),)).fetchone()",
+                "print('1' if row else '0')",
+              ].join('; ')
+              const {stdout} = await runCommand(
+                python.cmd,
+                [...python.prefix, '-c', script, copiedDatabase, String(nowChrome)],
+                signal,
+              )
+              return stdout.trim() === '1'
+            } catch {
+              return false
+            } finally {
+              await fs.rm(tempDir, {recursive: true, force: true})
+            }
+          }
+
+          async function readLastUsedChromeProfile(root: string): Promise<string | undefined> {
+            try {
+              const data = JSON.parse(await fs.readFile(path.join(root, 'Local State'), 'utf8')) as {
+                profile?: {last_used?: unknown}
+              }
+              return typeof data.profile?.last_used === 'string' ? data.profile.last_used : undefined
+            } catch {
+              return undefined
+            }
+          }
+
+          function orderChromeProfiles(profiles: string[], lastUsed?: string): string[] {
+            return [...profiles].sort((a, b) => {
+              if (a === lastUsed) return -1
+              if (b === lastUsed) return 1
+              if (a === 'Default') return -1
+              if (b === 'Default') return 1
+              return a.localeCompare(b, undefined, {numeric: true})
+            })
+          }
+
+          function chromeCookieSource(profile: string): string {
+            return `chrome/.instagram.com:${profile}`
+          }
+
+          async function discoverLoggedInChromeSource(signal?: AbortSignal): Promise<string | undefined> {
+            const root = chromeProfileRoot()
+            const python = await findPython()
+            if (!root || !python) return undefined
+
+            try {
+              const entries = await fs.readdir(root, {withFileTypes: true})
+              const profiles = entries
+                .filter(entry => entry.isDirectory() && (entry.name === 'Default' || /^Profile \d+$/.test(entry.name)))
+                .map(entry => entry.name)
+              const ordered = orderChromeProfiles(profiles, await readLastUsedChromeProfile(root))
+
+              for (const profile of ordered) {
+                const database = await chromeCookieDatabase(path.join(root, profile))
+                if (database && (await hasValidInstagramSessionCookie(python, database, signal))) {
+                  return chromeCookieSource(profile)
+                }
+              }
+            } catch {
+              // Browser discovery is optional; the user can provide an explicit source.
+            }
+            return undefined
+          }
+
+          async function instagramCookieSource(signal?: AbortSignal): Promise<string | undefined> {
+            const configured = process.env.YOINKS_COOKIES_FROM_BROWSER?.trim()
+            return configured || discoverLoggedInChromeSource(signal)
+          }
+
+          function metadataString(metadata: Record<string, unknown>, keys: string[]): string | undefined {
+            for (const key of keys) {
+              const value = metadata[key]
+              if (typeof value === 'string' && value.trim()) return value.trim()
+              if (typeof value === 'number') return String(value)
+            }
+            return undefined
+          }
+
+          function nestedMetadataString(value: unknown): string | undefined {
+            if (!value || typeof value !== 'object') return undefined
+            return metadataString(value as Record<string, unknown>, ['username', 'name', 'account', 'id'])
+          }
+
+          function extensionFromUrl(value: string): string | undefined {
+            try {
+              const extension = path.extname(new URL(value).pathname).slice(1).toLowerCase()
+              return extension || undefined
+            } catch {
+              const extension = path.extname(value.split('?')[0] ?? '').slice(1).toLowerCase()
+              return extension || undefined
+            }
+          }
+
+          function collectGalleryItems(value: unknown, items: GalleryItem[]): void {
+            if (Array.isArray(value)) {
+              // gallery-dl message protocol: type 3 is an actual downloadable URL.
+              if (value[0] === 3 && typeof value[1] === 'string') {
+                const metadata = value[2] && typeof value[2] === 'object' ? (value[2] as Record<string, unknown>) : {}
+                const extension = metadataString(metadata, ['extension'])?.toLowerCase() ?? extensionFromUrl(value[1])
+                items.push({url: value[1], extension, metadata})
+                return
+              }
+              for (const child of value) collectGalleryItems(child, items)
+              return
+            }
+
+            if (value && typeof value === 'object') {
+              for (const child of Object.values(value as Record<string, unknown>)) collectGalleryItems(child, items)
+            }
+          }
+
+          function parseGalleryJson(stdout: string): GalleryItem[] {
+            const items: GalleryItem[] = []
+            const trimmed = stdout.trim()
+            if (!trimmed) return items
+
+            try {
+              collectGalleryItems(JSON.parse(trimmed), items)
+            } catch {
+              for (const line of trimmed.split('\n')) {
+                try {
+                  collectGalleryItems(JSON.parse(line), items)
+                } catch {
+                  // Ignore non-JSON output; diagnostics are collected from stderr.
+                }
+              }
+            }
+
+            const seen = new Set<string>()
+            return items.filter(item => {
+              if (seen.has(item.url)) return false
+              seen.add(item.url)
+              return true
+            })
+          }
+
+          function summarizeGallery(items: GalleryItem[]): GallerySummary {
+            let imageCount = 0
+            let videoCount = 0
+            for (const item of items) {
+              if (item.extension && IMAGE_EXTENSIONS.has(item.extension)) imageCount++
+              else if (item.extension && VIDEO_EXTENSIONS.has(item.extension)) videoCount++
+            }
+            return {count: items.length, imageCount, videoCount, otherCount: items.length - imageCount - videoCount}
+          }
+
+          function galleryTitle(items: GalleryItem[], url: string): string {
+            for (const item of items) {
+              const title = metadataString(item.metadata, ['title', 'description', 'caption', 'shortcode', 'post_id', 'id'])
+              if (title) return title.replace(/\s+/g, ' ').slice(0, 120)
+            }
+            try {
+              const parsed = new URL(url)
+              return `${parsed.hostname}${parsed.pathname}`.replace(/\/$/, '')
+            } catch {
+              return url
+            }
+          }
+
+          function galleryUploader(items: GalleryItem[]): string | undefined {
+            for (const item of items) {
+              const direct = metadataString(item.metadata, ['username', 'user', 'author', 'account'])
+              if (direct) return direct
+              for (const key of ['owner', 'user', 'author']) {
+                const nested = nestedMetadataString(item.metadata[key])
+                if (nested) return nested
+              }
+            }
+            return undefined
+          }
+
+          function stripLogPrefix(line: string): string {
+            return line.replace(/^\[[^\]]+\](?:\[[^\]]+\])?\s*/, '').trim()
+          }
+
+          function galleryDiagnostic(stderr: string): string | undefined {
+            const ignored = [
+              /^Extracted \d+ cookies from /i,
+              /^(?:Cookie )?version breakdown:/i,
+              /^Starting (?:Url|Download|Simulation)Job/i,
+              /^Using Instagram\w*Extractor/i,
+            ]
+            const lines = stderr
+              .split('\n')
+              .map(stripLogPrefix)
+              .filter(Boolean)
+              .filter(line => !ignored.some(pattern => pattern.test(line)))
+            const failures = lines.filter(line =>
+              /warning|error|fail|invalid|expired|login|required|checkpoint|challenge|private|unavailable|not found|forbidden|unauthorized|redirect|\b(?:401|403|404|429|5\d\d)\b|too many requests|rate[ -]?limit/i.test(line),
+            )
+            const selected = [...new Set(failures)].slice(-2).join(' · ')
+            return selected ? selected.slice(0, 600) : undefined
+          }
+
+          function isRateLimitMessage(value: string): boolean {
+            return /\b429\b|too many requests|rate[ -]?limit/i.test(value)
+          }
+
+          function instagramArgs(cookieSource?: string): string[] {
+            return [
+              '--verbose',
+              '-R',
+              '0',
+              '--sleep-request',
+              '6.0-12.0',
+              '-o',
+              'extractor.instagram.api=rest',
+              ...(cookieSource ? ['--cookies-from-browser', cookieSource] : []),
+            ]
+          }
+
+          async function probeGalleryItems(
+            gallerydl: string,
+            url: string,
+            cookieSource: string | undefined,
+            signal?: AbortSignal,
+          ): Promise<{items: GalleryItem[]; stderr: string}> {
+            const args = [
+              ...(isInstagramUrl(url) ? instagramArgs(cookieSource) : []),
+              '--dump-json',
+              '--simulate',
+              '--no-input',
+              '--no-colors',
+              url,
+            ]
+            const {stdout, stderr} = await runCommand(gallerydl, args, signal)
+            return {items: parseGalleryJson(stdout), stderr}
+          }
+
+          export async function probeGallery(url: string, signal?: AbortSignal): Promise<GalleryProbe> {
+            const gallerydl = await ensureGalleryDl(signal)
+            const cookieSource = isInstagramUrl(url) ? await instagramCookieSource(signal) : undefined
+
+            let items: GalleryItem[]
+            let stderr: string
+            try {
+              const attempt = await probeGalleryItems(gallerydl, url, cookieSource, signal)
+              items = attempt.items
+              stderr = attempt.stderr
+            } catch (error) {
+              const raw = error instanceof CommandError ? error.stderr : error instanceof Error ? error.message : String(error)
+              if (isInstagramUrl(url) && isRateLimitMessage(raw)) {
+                throw new Error('Instagram rate limit reached. Stop retrying and wait before making one new attempt.')
+              }
+              const diagnostic = galleryDiagnostic(raw)
+              throw new Error(diagnostic ?? (error instanceof Error ? error.message : String(error)))
+            }
+
+            if (items.length === 0) {
+              const diagnostic = galleryDiagnostic(stderr)
+              if (isInstagramUrl(url)) {
+                const sessionHint = cookieSource
+                  ? `using ${cookieSource}`
+                  : 'without a logged-in browser session'
+                throw new Error(
+                  diagnostic
+                    ? `Instagram returned no media ${sessionHint}. ${diagnostic}`
+                    : `Instagram returned no downloadable media ${sessionHint}. Confirm the post opens in the logged-in browser profile.`,
+                )
+              }
+              throw new Error(diagnostic ?? 'gallery-dl found no downloadable media at this link.')
+            }
+
+            if (cookieSource) instagramCookieByUrl.set(url, cookieSource)
+            else instagramCookieByUrl.delete(url)
+
+            return {
+              title: galleryTitle(items, url),
+              uploader: galleryUploader(items),
+              summary: summarizeGallery(items),
+            }
+          }
+
+          export function galleryChoices(summary: GallerySummary): Array<{label: string; mode: GalleryMode}> {
+            const plural = (count: number, singular: string) => `${count} ${singular}${count === 1 ? '' : 's'}`
+
+            if (summary.imageCount > 0 && summary.videoCount > 0) {
+              return [
+                {label: `all media · ${plural(summary.count, 'file')}`, mode: 'all'},
+                {label: `images only · ${plural(summary.imageCount, 'image')}`, mode: 'images'},
+                {label: `videos only · ${plural(summary.videoCount, 'video')}`, mode: 'videos'},
+              ]
+            }
+            if (summary.imageCount > 0) {
+              return [{label: `${plural(summary.imageCount, 'image')} · original files`, mode: 'images'}]
+            }
+            if (summary.videoCount > 0) {
+              return [{label: `${plural(summary.videoCount, 'video')} · original files`, mode: 'videos'}]
+            }
+            return [{label: `${plural(summary.count, 'file')} · original files`, mode: 'all'}]
+          }
+
+          function safePathSegment(value: string): string {
+            const cleaned = value
+              .normalize('NFKC')
+              .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+              .replace(/\s+/g, ' ')
+              .replace(/[. ]+$/g, '')
+              .trim()
+            return (cleaned || 'gallery').slice(0, 80)
+          }
+
+          function galleryOutputDir(url: string, outDir: string): string {
+            try {
+              const parsed = new URL(url)
+              const id = parsed.pathname.split('/').filter(Boolean).at(-1)
+              const host = parsed.hostname.replace(/^www\./, '').split('.')[0] || 'gallery'
+              return path.join(outDir, safePathSegment(`${host}-${id || 'gallery'}`))
+            } catch {
+              return path.join(outDir, `gallery-${Date.now()}`)
+            }
+          }
+
+          function galleryFilter(mode: GalleryMode): string[] {
+            if (mode === 'all') return []
+            const extensions = [...(mode === 'images' ? IMAGE_EXTENSIONS : VIDEO_EXTENSIONS)]
+              .sort()
+              .map(extension => `'${extension}'`)
+              .join(', ')
+            return ['--filter', `extension and extension.lower() in (${extensions})`]
+          }
+
+          function withYtDlpOnPath(ytdlp: string): NodeJS.ProcessEnv {
+            if (!path.isAbsolute(ytdlp)) return process.env
+            return {...process.env, PATH: `${path.dirname(ytdlp)}${path.delimiter}${process.env.PATH ?? ''}`}
+          }
+
+          let activeChild: ChildProcess | undefined
+          process.on('exit', () => activeChild?.kill('SIGTERM'))
+
+          export function downloadGallery(
+            opts: {ytdlp: string; url: string; mode: GalleryMode; outDir: string},
+            onProcessing: () => void,
+            signal?: AbortSignal,
+          ): Promise<string> {
+            return new Promise((resolve, reject) => {
+              void (async () => {
+                try {
+                  const gallerydl = await ensureGalleryDl(signal)
+                  const targetDir = galleryOutputDir(opts.url, opts.outDir)
+                  const cookieSource = isInstagramUrl(opts.url)
+                    ? instagramCookieByUrl.get(opts.url) ?? (await instagramCookieSource(signal))
+                    : undefined
+                  await fs.mkdir(targetDir, {recursive: true})
+                  onProcessing()
+
+                  const args = [
+                    ...(isInstagramUrl(opts.url) ? instagramArgs(cookieSource) : []),
+                    '--no-input',
+                    '--no-colors',
+                    '-D',
+                    targetDir,
+                    '--Print',
+                    'after:{_path}',
+                    '--Print',
+                    'skip:{_path}',
+                    ...galleryFilter(opts.mode),
+                    opts.url,
+                  ]
+                  const child = spawn(gallerydl, args, {signal, env: withYtDlpOnPath(opts.ytdlp)})
+                  activeChild = child
+                  let stderr = ''
+                  child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
+                  child.on('error', reject)
+                  child.on('close', (code: number | null) => {
+                    activeChild = undefined
+                    if (signal?.aborted) {
+                      reject(new Error('Download cancelled.'))
+                      return
+                    }
+                    if (code === 0) resolve(targetDir)
+                    else reject(new Error(galleryDiagnostic(stderr) ?? cleanGalleryDlError(stderr) ?? `gallery-dl exited with code ${code}`))
+                  })
+                } catch (error) {
+                  reject(error)
+                }
+              })()
+            })
+          }
+
+          function cleanGalleryDlError(stderr: string): string {
+            const lines = stderr
+              .split('\n')
+              .map(line => line.trim())
+              .filter(Boolean)
+            const last = lines.filter(line => /\[(error|warning)\]/i.test(line)).at(-1) ?? lines.at(-1)
+            return last?.replace(/^\[[^\]]+\]\[(?:error|warning)\]\s*/i, '') ?? ''
+          }
+
+          export const __test = {
+            isInstagramPost,
+            isInstagramReel,
+            isRateLimitMessage,
+            orderChromeProfiles,
+            chromeCookieSource,
+            parseGalleryJson,
+            summarizeGallery,
+          }
+          TS
+
+      - name: Add managed downloader updater
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('src/lib/ytdlp.ts')
+          text = path.read_text()
+          text = text.replace('  probeGallery,\n', '  probeGallery,\n  updateGalleryDl,\n')
+          pattern = re.compile(r"const YOINKS_DIR = .*?(?=/\*\* Find ffmpeg)", re.S)
+          replacement = r'''const YOINKS_DIR = path.join(os.homedir(), '.yoinks', 'bin')
+          const RELEASE_BASE = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download'
+          const GALLERY_SENTINEL = '__yoinks_gallerydl__'
+
+          function ytDlpAssetName(): string {
+            if (process.platform === 'win32') return 'yt-dlp.exe'
+            if (process.platform === 'darwin') return 'yt-dlp_macos'
+            return process.arch === 'arm64' ? 'yt-dlp_linux_aarch64' : 'yt-dlp_linux'
+          }
+
+          function managedYtDlpPath(): string {
+            return path.join(YOINKS_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
+          }
+
+          // async on purpose: a spawnSync here blocks the event loop, which freezes Ink
+          function commandWorks(cmd: string, args: string[]): Promise<boolean> {
+            return new Promise(resolve => {
+              let child
+              try {
+                child = spawn(cmd, args, {stdio: 'ignore', timeout: 10_000})
+              } catch {
+                resolve(false)
+                return
+              }
+              child.on('error', () => resolve(false))
+              child.on('close', (code: number | null) => resolve(code === 0))
+            })
+          }
+
+          async function swapYtDlp(tmp: string, local: string): Promise<void> {
+            const backup = `${local}.previous`
+            await fs.rm(backup, {force: true})
+            let hasBackup = false
+            try {
+              await fs.rename(local, backup)
+              hasBackup = true
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+            }
+
+            try {
+              await fs.rename(tmp, local)
+              await fs.rm(backup, {force: true})
+            } catch (error) {
+              await fs.rm(local, {force: true})
+              if (hasBackup) await fs.rename(backup, local)
+              throw error
+            }
+          }
+
+          async function installYtDlp(
+            onStatus: (message: string) => void,
+            signal?: AbortSignal,
+          ): Promise<string> {
+            const local = managedYtDlpPath()
+            const tmp = `${local}.download`
+            onStatus('fetching latest yt-dlp…')
+            await fs.mkdir(YOINKS_DIR, {recursive: true})
+            await fs.rm(tmp, {force: true})
+
+            try {
+              const response = await fetch(`${RELEASE_BASE}/${ytDlpAssetName()}`, {signal})
+              if (!response.ok || !response.body) {
+                throw new Error(`download returned HTTP ${response.status}`)
+              }
+              await pipeline(Readable.fromWeb(response.body as never), createWriteStream(tmp), {signal})
+              await fs.chmod(tmp, 0o755)
+              if (!(await commandWorks(tmp, ['--version']))) throw new Error('the downloaded binary could not be started')
+              await swapYtDlp(tmp, local)
+              return local
+            } catch (error) {
+              await fs.rm(tmp, {force: true})
+              throw new Error(`Could not update yt-dlp. ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+
+          export async function updateYtDlp(
+            onStatus: (message: string) => void,
+            signal?: AbortSignal,
+          ): Promise<string> {
+            return installYtDlp(onStatus, signal)
+          }
+
+          export async function updateDownloaders(
+            onStatus: (message: string) => void,
+            signal?: AbortSignal,
+          ): Promise<void> {
+            await updateYtDlp(onStatus, signal)
+            await updateGalleryDl(onStatus, signal)
+          }
+
+          /** Resolve the managed yt-dlp binary, downloading the latest release on first use. */
+          export async function ensureYtDlp(onStatus: (message: string) => void, signal?: AbortSignal): Promise<string> {
+            const local = managedYtDlpPath()
+            if (await commandWorks(local, ['--version'])) return local
+
+            try {
+              return await installYtDlp(onStatus, signal)
+            } catch (error) {
+              if (await commandWorks('yt-dlp', ['--version'])) return 'yt-dlp'
+              throw error
+            }
+          }
+
+          '''
+          updated, count = pattern.subn(replacement, text)
+          if count != 1:
+              raise SystemExit(f'Expected one yt-dlp bootstrap block, found {count}')
+          path.write_text(updated)
+          PY
+
+      - name: Add --update-tools CLI option
+        shell: bash
+        run: |
+          cat > src/lib/args.ts <<'TS'
+          import {isThemeMode, type ThemeMode} from '../theme.js'
+
+          export type CliArgs = {
+            help: boolean
+            version: boolean
+            updateTools?: boolean
+            initialUrl?: string
+            themeMode?: ThemeMode
+            error?: string
+          }
+
+          export function parseArgs(args: string[]): CliArgs {
+            const result: CliArgs = {help: false, version: false}
+            const positional: string[] = []
+
+            for (let index = 0; index < args.length; index++) {
+              const arg = args[index]!
+              if (arg === '-h' || arg === '--help') {
+                result.help = true
+              } else if (arg === '-v' || arg === '--version') {
+                result.version = true
+              } else if (arg === '--update-tools') {
+                result.updateTools = true
+              } else if (arg === '--theme') {
+                const value = args[++index]
+                if (!value) return {...result, error: '--theme needs a value: auto, light, or dark'}
+                if (!isThemeMode(value)) return {...result, error: `unknown theme “${value}” — use auto, light, or dark`}
+                result.themeMode = value
+              } else if (arg.startsWith('--theme=')) {
+                const value = arg.slice('--theme='.length)
+                if (!isThemeMode(value)) return {...result, error: `unknown theme “${value}” — use auto, light, or dark`}
+                result.themeMode = value
+              } else if (arg.startsWith('-')) {
+                return {...result, error: `unknown option “${arg}”`}
+              } else {
+                positional.push(arg)
+              }
+            }
+
+            if (positional.length > 1) return {...result, error: 'expected a single url'}
+            if (result.updateTools && positional.length > 0) {
+              return {...result, error: '--update-tools cannot be combined with a url'}
+            }
+            result.initialUrl = positional[0]
+            return result
+          }
+          TS
+
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('src/cli.tsx')
+          text = path.read_text()
+          text = text.replace("import {isProbablyUrl} from './lib/platforms.js'", "import {isProbablyUrl} from './lib/platforms.js'\nimport {updateDownloaders} from './lib/ytdlp.js'")
+          text = text.replace('    --theme <mode>  use auto, light, or dark for this run\n', '    --theme <mode>  use auto, light, or dark for this run\n    --update-tools  update managed yt-dlp and gallery-dl\n')
+          marker = "if (args.version) {\n  console.log(VERSION)\n  process.exit(0)\n}\n"
+          addition = marker + "\nif (args.updateTools) {\n  try {\n    await updateDownloaders(message => console.log(`• ${message}`))\n    console.log('✓ yt-dlp and gallery-dl are up to date')\n    process.exit(0)\n  } catch (error) {\n    console.error(`yoinks: ${error instanceof Error ? error.message : String(error)}`)\n    process.exit(1)\n  }\n}\n"
+          if text.count(marker) != 1:
+              raise SystemExit('Could not locate CLI version block')
+          path.write_text(text.replace(marker, addition))
+
+          test = Path('src/lib/args.test.ts')
+          text = test.read_text()
+          insert = """
+
+          test('parses the managed downloader update command and rejects a url with it', () => {
+            assert.equal(parseArgs(['--update-tools']).updateTools, true)
+            assert.match(parseArgs(['--update-tools', 'https://example.com']).error ?? '', /cannot be combined/)
+          })
+          """
+          test.write_text(text + insert)
+          PY
+
+      - name: Replace gallery regression tests
+        shell: bash
+        run: |
+          cat > src/lib/gallerydl.test.ts <<'TS'
+          import assert from 'node:assert/strict'
+          import test from 'node:test'
+          import {__test, galleryChoices} from './gallerydl.js'
+
+          test('recognizes Instagram posts and Reels separately', () => {
+            assert.equal(__test.isInstagramPost('https://www.instagram.com/p/DbAY89yiZrJ/'), true)
+            assert.equal(__test.isInstagramPost('https://www.instagram.com/reel/abc/'), false)
+            assert.equal(__test.isInstagramReel('https://www.instagram.com/reel/abc/'), true)
+            assert.equal(__test.isInstagramReel('https://www.instagram.com/p/abc/'), false)
+          })
+
+          test('parses gallery-dl type-3 URL messages and ignores type-2 directory metadata', () => {
+            const stdout = JSON.stringify([
+              [1, '', {title: 'Example'}],
+              [2, null, {title: 'Example post'}],
+              [3, 'https://cdn.example/1.jpg', {extension: 'jpg'}],
+              [3, 'https://cdn.example/2.mp4', {extension: 'mp4'}],
+            ])
+            const items = __test.parseGalleryJson(stdout)
+            assert.equal(items.length, 2)
+            assert.deepEqual(__test.summarizeGallery(items), {
+              count: 2,
+              imageCount: 1,
+              videoCount: 1,
+              otherCount: 0,
+            })
+          })
+
+          test('builds all, image-only, and video-only choices for mixed posts', () => {
+            assert.deepEqual(
+              galleryChoices({count: 4, imageCount: 3, videoCount: 1, otherCount: 0}).map(choice => choice.label),
+              ['all media · 4 files', 'images only · 3 images', 'videos only · 1 video'],
+            )
+          })
+
+          test('detects Instagram rate limits', () => {
+            assert.equal(__test.isRateLimitMessage('429 Too Many Requests'), true)
+            assert.equal(__test.isRateLimitMessage('API rate limit reached'), true)
+            assert.equal(__test.isRateLimitMessage('not found'), false)
+          })
+
+          test('prioritizes the last-used Chrome profile and scopes cookies to Instagram subdomains', () => {
+            assert.deepEqual(
+              __test.orderChromeProfiles(['Default', 'Profile 2', 'Profile 3'], 'Profile 3'),
+              ['Profile 3', 'Default', 'Profile 2'],
+            )
+            assert.equal(__test.chromeCookieSource('Default'), 'chrome/.instagram.com:Default')
+          })
+          TS
+
+      - name: Update package metadata and Git installs
+        shell: bash
+        run: |
+          node <<'JS'
+          const fs = require('node:fs')
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          pkg.version = '0.4.0'
+          pkg.scripts.check = 'npm test && npm run typecheck && npm run build'
+          pkg.scripts.prepare = 'npm run build'
+          pkg.scripts.prepublishOnly = 'npm run check'
+          pkg.contributors = ['yaney01']
+          pkg.repository = {type: 'git', url: 'git+https://github.com/yaney01/yoinks.git'}
+          pkg.homepage = 'https://github.com/yaney01/yoinks#readme'
+          pkg.bugs = {url: 'https://github.com/yaney01/yoinks/issues'}
+          fs.writeFileSync('package.json', `${JSON.stringify(pkg, null, 2)}\n`)
+          JS
+
+      - name: Write complete installation and maintenance guide
+        shell: bash
+        run: |
+          cat > README.md <<'MD'
+          # yoinks
+
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+            <img src="assets/logo-light.svg" alt="yoinks" width="288">
+          </picture>
+
+          Download videos, audio, images, galleries, manga, and mixed-media posts from one terminal interface.
+
+          - `yt-dlp` handles Reels, videos, audio, formats, merging, and MP3 extraction.
+          - `gallery-dl` handles images, carousels, manga, and posts containing both images and videos.
+          - Managed tools are stored together under `~/.yoinks/bin`.
+
+          ## Requirements
+
+          - Node.js 22 or newer. Node 24 LTS is recommended.
+          - Python 3.10 or newer linked with OpenSSL. On macOS, use Homebrew Python rather than the old system Python.
+          - A browser logged into Instagram for posts that require authentication.
+
+          ## Install on macOS
+
+          Install Python and use nvm for Node.js:
+
+          ```sh
+          brew install python nvm
+          mkdir -p ~/.nvm
+          ```
+
+          Add this to `~/.zshrc` if Homebrew did not add nvm automatically:
+
+          ```sh
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$(brew --prefix nvm)/nvm.sh" ] && . "$(brew --prefix nvm)/nvm.sh"
+          ```
+
+          Reload the shell and install Node 24:
+
+          ```sh
+          source ~/.zshrc
+          nvm install 24
+          nvm use 24
+          nvm alias default 24
+          ```
+
+          Install the latest `main` build directly from GitHub:
+
+          ```sh
+          npm uninstall -g yoinks 2>/dev/null || true
+          npm install -g github:yaney01/yoinks
+          ```
+
+          Verify:
+
+          ```sh
+          node -v
+          python3 -c 'import ssl,sys; print(sys.version); print(ssl.OPENSSL_VERSION)'
+          yoinks --version
+          yoinks --help
+          ```
+
+          The first download installs the managed backends here:
+
+          ```text
+          ~/.yoinks/bin/
+          ├── yt-dlp
+          └── gallery-dl/
+          ```
+
+          You do not need to install yt-dlp or gallery-dl separately.
+
+          ## Use
+
+          ```sh
+          yoinks "https://youtu.be/..."
+          yoinks "https://www.instagram.com/reel/.../"
+          yoinks "https://www.instagram.com/p/.../"
+          yoinks
+          ```
+
+          Downloads are saved to `~/Downloads`.
+
+          - Videos and audio are individual files.
+          - Galleries and mixed posts use a folder such as `~/Downloads/instagram-DbAY89yiZrJ/`.
+          - Mixed Instagram posts offer `all media`, `images only`, and `videos only`.
+
+          ## Instagram login
+
+          yoinks checks local Chrome profiles for a non-expired Instagram `sessionid`, prioritizes the last-used profile, and passes only the selected profile to gallery-dl. This avoids repeatedly contacting Instagram with every Chrome profile.
+
+          To force a browser or profile:
+
+          ```sh
+          YOINKS_COOKIES_FROM_BROWSER="chrome/.instagram.com:Default" yoinks "<instagram-url>"
+          YOINKS_COOKIES_FROM_BROWSER="chrome/.instagram.com:Profile 1" yoinks "<instagram-url>"
+          YOINKS_COOKIES_FROM_BROWSER="safari/.instagram.com" yoinks "<instagram-url>"
+          YOINKS_COOKIES_FROM_BROWSER="firefox/.instagram.com" yoinks "<instagram-url>"
+          ```
+
+          If Instagram returns `429 Too Many Requests`, yoinks stops immediately. Do not keep retrying; wait and make one new attempt after the restriction clears.
+
+          ## Update yoinks
+
+          Update the application code from `main`:
+
+          ```sh
+          npm install -g github:yaney01/yoinks
+          ```
+
+          ## Update yt-dlp and gallery-dl
+
+          Upstream tools are not silently changed during normal downloads. This avoids an unexpected upstream release breaking a working installation.
+
+          Update both managed tools explicitly:
+
+          ```sh
+          yoinks --update-tools
+          ```
+
+          Updates are installed into temporary paths, verified with `--version`, and then swapped into `~/.yoinks/bin`. If installation fails, the current working copy is retained.
+
+          To completely rebuild both tools:
+
+          ```sh
+          rm -rf ~/.yoinks/bin
+          yoinks --update-tools
+          ```
+
+          A scheduled GitHub Actions smoke test also installs the latest upstream tools weekly, so packaging or runtime incompatibilities can be detected before a release.
+
+          ## Media routing
+
+          ```text
+          Reels, single videos, audio
+          └─ yt-dlp → resolution and MP3 choices
+
+          Images, carousels, manga
+          └─ gallery-dl → original media files
+
+          Image + video mixed posts
+          └─ gallery-dl → all / images only / videos only
+          ```
+
+          Instagram `/p/` links are inspected with gallery-dl first. A post containing exactly one video is handed to yt-dlp so resolution and audio choices remain available. Reels go directly to yt-dlp.
+
+          ## Local development
+
+          ```sh
+          git clone https://github.com/yaney01/yoinks.git
+          cd yoinks
+          npm install
+          npm run check
+          npm link
+          yoinks "<url>"
+          ```
+
+          ## Troubleshooting
+
+          Check the active command and versions:
+
+          ```sh
+          which yoinks
+          yoinks --version
+          ~/.yoinks/bin/yt-dlp --version
+          ~/.yoinks/bin/gallery-dl/bin/gallery-dl --version
+          ```
+
+          On macOS, the managed gallery-dl environment must report OpenSSL rather than LibreSSL:
+
+          ```sh
+          ~/.yoinks/bin/gallery-dl/bin/python -c 'import ssl; print(ssl.OPENSSL_VERSION)'
+          ```
+
+          If Chrome cookies cannot be read, close Chrome completely and retry once, or provide `YOINKS_COOKIES_FROM_BROWSER` explicitly.
+
+          ## Fair use
+
+          yoinks is a personal-archiving tool. Only download media you have the right to keep, and follow the platform's terms and applicable law.
+
+          ## License
+
+          [MIT](LICENSE)
+          MD
+
+      - name: Add permanent CI and upstream compatibility smoke test
+        shell: bash
+        run: |
+          cat > .github/workflows/ci.yml <<'YAML'
+          name: CI
+
+          on:
+            push:
+              branches: [main]
+            pull_request:
+            workflow_dispatch:
+            schedule:
+              - cron: '17 4 * * 1'
+
+          permissions:
+            contents: read
+
+          jobs:
+            check:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-node@v4
+                  with:
+                    node-version: 22
+                    cache: npm
+                - run: npm ci
+                - run: npm run check
+
+            upstream-smoke:
+              if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-node@v4
+                  with:
+                    node-version: 22
+                    cache: npm
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: '3.12'
+                - run: npm ci
+                - run: node dist/cli.js --update-tools
+                - run: ~/.yoinks/bin/yt-dlp --version
+                - run: ~/.yoinks/bin/gallery-dl/bin/gallery-dl --version
+          YAML
+
+      - name: Remove temporary workflows
+        run: |
+          rm -f .github/workflows/inspect-release-cleanup.yml
+          rm -f .github/workflows/finalize-dual-engine-release.yml
+
+      - name: Install and validate
+        run: |
+          npm install
+          npm run check
+          git diff --check
+
+      - name: Commit final release cleanup
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "finalize dual-engine downloader release"
+          git push origin HEAD:agent/unify-downloader-paths
