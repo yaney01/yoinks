@@ -6,6 +6,7 @@ import {captureFrames} from './lib/click-map.js'
 import {parseArgs} from './lib/args.js'
 import {readClipboard} from './lib/clipboard.js'
 import {isProbablyUrl} from './lib/platforms.js'
+import {updateDownloaders} from './lib/updater.js'
 
 // read at runtime from the shipped package.json so npm version bumps
 // can't drift from a hardcoded constant
@@ -25,6 +26,7 @@ const HELP = `
 
   Options
     --theme <mode>  use auto, light, or dark for this run
+    --update-tools  update managed yt-dlp and gallery-dl
     -h, --help      show this help
     -v, --version   show version
 
@@ -47,6 +49,17 @@ if (args.help) {
 if (args.version) {
   console.log(VERSION)
   process.exit(0)
+}
+
+if (args.updateTools) {
+  try {
+    await updateDownloaders(message => console.log(`• ${message}`))
+    console.log('✓ yt-dlp and gallery-dl are up to date')
+    process.exit(0)
+  } catch (error) {
+    console.error(`yoinks: ${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  }
 }
 
 const initialUrl = args.initialUrl

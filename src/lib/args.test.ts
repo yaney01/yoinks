@@ -21,6 +21,11 @@ test('parses an equals-style theme option after the url', () => {
   })
 })
 
+test('parses the managed downloader update command and rejects a url with it', () => {
+  assert.equal(parseArgs(['--update-tools']).updateTools, true)
+  assert.match(parseArgs(['--update-tools', 'https://example.com']).error ?? '', /cannot be combined/)
+})
+
 test('rejects missing, invalid, and unknown options', () => {
   assert.match(parseArgs(['--theme']).error ?? '', /needs a value/)
   assert.match(parseArgs(['--theme', 'sepia']).error ?? '', /unknown theme/)
