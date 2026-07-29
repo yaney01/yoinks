@@ -18,9 +18,14 @@
     "test": "tsx --test src/**/*.test.ts",
     "typecheck": "tsc --noEmit",
     "start": "node dist/cli.js",
-    "prepublishOnly": "npm test && npm run typecheck && npm run build"
+    "check": "npm test && npm run typecheck && npm run build",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run check"
   },
   "author": "Pablo Stanley",
+  "contributors": [
+    "yaney01"
+  ],
   "keywords": [
     "video",
     "image",
@@ -53,10 +58,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pablostanley/yoinks.git"
+    "url": "git+https://github.com/yaney01/yoinks.git"
   },
-  "homepage": "https://github.com/pablostanley/yoinks#readme",
+  "homepage": "https://github.com/yaney01/yoinks#readme",
   "bugs": {
-    "url": "https://github.com/pablostanley/yoinks/issues"
+    "url": "https://github.com/yaney01/yoinks/issues"
   }
 }
