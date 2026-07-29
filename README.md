@@ -93,6 +93,9 @@ is handed back to yt-dlp so resolution and audio options remain available.
 Instagram Reels go directly to yt-dlp. For other sites, yoinks tries yt-dlp and
 falls back to gallery-dl when the page is a gallery or collection.
 
+The gallery probe reads gallery-dl's native message protocol: message type `2`
+is directory/post metadata, while type `3` is an actual downloadable media URL.
+
 ## Instagram login cookies
 
 Instagram frequently returns no media to anonymous requests. yoinks inspects the
@@ -113,9 +116,9 @@ For Safari, Firefox, a custom Chrome location, or to force one profile, set the
 cookie source for that run:
 
 ```sh
-YOINKS_COOKIES_FROM_BROWSER="chrome/instagram.com:Profile 1" yoinks "<instagram-url>"
-YOINKS_COOKIES_FROM_BROWSER="safari/instagram.com" yoinks "<instagram-url>"
-YOINKS_COOKIES_FROM_BROWSER="firefox/instagram.com" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="chrome/.instagram.com:Profile 1" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="safari/.instagram.com" yoinks "<instagram-url>"
+YOINKS_COOKIES_FROM_BROWSER="firefox/.instagram.com" yoinks "<instagram-url>"
 ```
 
 The value follows gallery-dl's `--cookies-from-browser` syntax:
