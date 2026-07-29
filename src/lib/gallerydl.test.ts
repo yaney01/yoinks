@@ -42,3 +42,9 @@ test('extracts actionable browser cookie diagnostics', () => {
     'Extracted 12 cookies from Chrome · Failed to decrypt cookie (AES-GCM MAC)',
   )
 })
+
+test('detects Instagram rate-limit failures and not unrelated errors', () => {
+  assert.equal(__test.isRateLimitMessage("'429 Too Many Requests' for Instagram"), true)
+  assert.equal(__test.isRateLimitMessage('API rate limit exceeded'), true)
+  assert.equal(__test.isRateLimitMessage('Failed to decrypt cookie'), false)
+})
