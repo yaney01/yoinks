@@ -1,6 +1,6 @@
 {
   "name": "yoinks",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Download videos, audio, images, galleries, and mixed-media posts from your terminal with yt-dlp and gallery-dl.",
   "type": "module",
   "bin": {
@@ -19,7 +19,6 @@
     "typecheck": "tsc --noEmit",
     "start": "node dist/cli.js",
     "check": "npm test && npm run typecheck && npm run build",
-    "prepare": "npm run build",
     "prepublishOnly": "npm run check"
   },
   "author": "Pablo Stanley",

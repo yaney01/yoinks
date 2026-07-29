@@ -49,7 +49,7 @@ npm uninstall -g yoinks 2>/dev/null || true
 npm install -g github:yaney01/yoinks
 ```
 
-The package includes a `prepare` script, so GitHub installation builds `dist/cli.js` automatically.
+The repository includes a verified `dist/cli.js`, so GitHub installation does not compile the project on the user’s machine.
 
 Verify:
 
